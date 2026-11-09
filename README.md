@@ -42,7 +42,10 @@ line. Cron it weekly, or use a systemd timer:
 ```
 04 30 * * *  cd /opt/bastion-open && docker compose run --rm scanner >> /var/log/bastion.log 2>&1
 ```
-Same digest twice in a row = nothing changed, safe to skim the log only when it moves.
+Same digest twice in a row = nothing changed, safe to skim the log only when it
+moves. (Note: a run with a cold cache reports some severities as unknown until
+OSV details are fetched; expect one digest drift in the first day, then
+stability. The fix-cache guard means stale formats can't linger.)
 
 ## Fixing things
 
