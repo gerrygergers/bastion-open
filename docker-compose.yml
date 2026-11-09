@@ -1,0 +1,30 @@
+# bastion-open: your host's security posture, one command.
+# Copy to your machine: docker compose up  (or run.sh). No creds needed to start.
+name: bastion-open
+services:
+  scanner:
+    image: bastion-open:local
+    build: .
+    volumes:
+      - /:/host:ro              # host inventory (read-only; the whole point)
+      - ./config:/app/config:ro
+      - bastion-data:/data      # caches + reports, survives restarts
+    environment:
+      BASTION_HOST: /host
+      # BASTION_MARK_FIXABLE: "1"   # root only; annotates findings with "apt could upgrade X"
+    # To scan docker images/URLs too, list them in config/config.yaml (see example).
+    command: python3 /app/scan.py
+    # Weekly scans: run via your own cron/systemd timer (`docker compose run --rm scanner`).
+  fixer:                        # OPTIONAL remediation (docs/FIXING.md). Needs rw host mount.
+    image: bastion-open:local
+    profiles: ["fix"]           # never starts unless: docker compose --profile fix run fixer
+    entrypoint: ["python3", "/app/fix.py"]
+    volumes:
+      - /:/host                 # READ-WRITE — that's why it's double-gated
+      - ./config:/app/config:ro
+      - bastion-data:/data
+    environment:
+      BASTION_FIX: "on"
+      BASTION_FIX_CONFIRM: "yes-i-understand"
+volumes:
+  bastion-data:

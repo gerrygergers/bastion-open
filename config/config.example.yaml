@@ -1,0 +1,17 @@
+# bastion-open inventory. Everything here is OPTIONAL — with no config the
+# scanner just audits the mounted host (/:/host). Add targets as you like.
+
+targets:
+  - name: local-host          # this machine, via the :/host mount
+    host: /host
+  # - name: my-web-image       # any docker image, via trivy
+  #   image: nginx:latest
+  # - name: my-app-checkout    # a source tree you keep mounted (trivy fs)
+  #   fs: /scan/app
+  # - name: second-box         # another machine: run bastion-open ON that box,
+  #   host: /host              # forward results; v0.1 scans hosts it runs on.
+
+urls:
+  # public endpoints you want probed for degradation (4xx/5xx/timeout -> finding)
+  # - https://example.com
+  # - https://status.example.com
