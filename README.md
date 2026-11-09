@@ -76,7 +76,7 @@ fix.py (opt-in)     ->  reads last-scan, chroot apt --only-upgrade, journalled
 ## Relationship to bastion (the original)
 
 This repo carries the gauntlet's scanning brain and the KEV/OSV plumbing. It
-intentionally leaves behind: per-box ssh config, UniFi/Vikunja/Caddy integrations,
+intentionally leaves behind: per-box ssh config, network-appliance/ticket/proxy
 cron monitor-gating glue, and any specific machine. See `docs/BASTION.md` for the
 full lineage.
 

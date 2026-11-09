@@ -5,8 +5,8 @@ Short version: bugs and features welcome, keep the two invariants.
 1. **Read-only by default.** Scanner code must never mutate the target system.
    Remediation lives in `fix.py` behind its gates and stays that way.
 2. **No machine-specific assumptions.** Paths come from env/config, distros are
-   detected not assumed, and nothing may require a homelab, a VPN, or Gerry's
-   kernel version.
+   detected not assumed, and nothing may require a homelab, a VPN, or anyone's
+   particular kernel version.
 
 Practical notes:
 - The OSV semantics in `bastion_core.osv_batch` are load-bearing and documented
