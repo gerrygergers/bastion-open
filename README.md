@@ -12,8 +12,8 @@ hostname quirks.
 ## Quick start (30 seconds)
 
 ```bash
-git clone https://github.com/YOU/bastion-open && cd bastion-open
-docker compose run --rm scanner
+git clone https://github.com/gerrygergers/bastion-open && cd bastion-open
+docker compose run --build --rm scanner
 ```
 
 That's it: build image, mount `/` read-only, audit, print the digest, leave.
@@ -40,7 +40,7 @@ With no config, it just audits the mounted host. No API keys, no accounts.
 `docker compose run --rm scanner` is idempotent and prints a stable `digest=`
 line. Cron it weekly, or use a systemd timer:
 ```
-04 30 * * *  cd /opt/bastion-open && docker compose run --rm scanner >> /var/log/bastion.log 2>&1
+04 30 * * *  cd /opt/bastion-open && docker compose run --build --rm scanner >> /var/log/bastion.log 2>&1
 ```
 Same digest twice in a row = nothing changed, safe to skim the log only when it
 moves. (Note: a run with a cold cache reports some severities as unknown until
