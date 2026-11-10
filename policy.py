@@ -30,8 +30,11 @@ def _cfg():
 
 
 def _incidents():
-    """{pkgname_lower: reason} for unresolved entries in config/incidents.yaml.
-    Shape: incidents: [{packages: [..], reason: str, resolved: bool}]"""
+    """{pkgname: reason} held packages. Two sources:
+    1. config/incidents.yaml (curated; entries may mark exact-match with leading "!")
+    2. GitHub malware-advisory feed, last 30d (best effort; exact names only —
+       the feed contains generic words that would substring-match distro pkgs).
+    KEV catalog product matches are deliberately NOT incident signals."""
     out = {}
     for cand in (Path(os.environ.get("BASTION_CONFIG", "/app/config/config.yaml")).parent / "incidents.yaml",
                  Path(__file__).parent / "config" / "incidents.yaml"):
@@ -44,12 +47,30 @@ def _incidents():
             for e in data.get("incidents", []):
                 if not e.get("resolved"):
                     for p in e.get("packages", []):
-                        out[str(p).lower()] = e.get("reason", "incident")
+                        out.setdefault(str(p).lower(), e.get("reason", "incident"))
             break
         except FileNotFoundError:
             continue
         except Exception:
             break
+    try:
+        from bastion_core import http_json
+        raw = http_json("https://api.github.com/advisories?type=malware&per_page=100", 30)
+        items = raw.get("items", []) if isinstance(raw, dict) else raw  # GH returns a bare list
+        cutoff = time.time() - 30 * 86400
+        for i in items:
+            try:
+                from datetime import datetime, timezone
+                pt = datetime.fromisoformat(str(i.get("published_at", ""))[:19].replace("Z", "") + "+00:00").timestamp()
+            except Exception:
+                pt = 0
+            if pt >= cutoff:
+                for v in (i.get("vulnerabilities") or []):
+                    pkg = str(((v.get("package") or {}).get("name") or "")).lower()
+                    if pkg:
+                        out.setdefault("!" + pkg, "GitHub malware advisory " + str(i.get("ghsa_id", "")))
+    except Exception:
+        pass  # offline/no-auth: curated incidents.yaml still gates
     return out
 
 
@@ -111,7 +132,7 @@ def decide(findings):
         prior = st["pending"].get(pkg)
         first_seen = prior["first_seen"] if prior else NOW
         start = max(first_seen, g["pub"]) if g["pub"] else first_seen
-        hit = incidents.get(pkg.lower())
+        hit = incidents.get(pkg.lower()) or incidents.get("!" + pkg.lower())
         if hit:
             reason = ("URGENT but under supply-chain incident watch (" + hit + ") - review manually"
                       if urgent(g) else "supply-chain incident watch: " + hit)
