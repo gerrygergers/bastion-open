@@ -114,6 +114,13 @@ def test_policy_decision():
     d2 = policy.decide(fnd, cfg={"soak": 48 * 3600, "cvss": 9.0},
                        incidents={"!openssl": "malware advisory"}, now=1_800_000_000)
     assert "openssl" not in d2["apply"]
+    # plain (curated) names match fuzzily both ways, len>=4; "!" = exact only
+    d3 = policy.decide(fnd, cfg={"soak": 48 * 3600, "cvss": 9.0},
+                       incidents={"openssl": "xz-style"}, now=1_800_000_000)
+    assert "openssl" not in d3["apply"]
+    d4 = policy.decide(fnd, cfg={"soak": 48 * 3600, "cvss": 9.0},
+                       incidents={"!ssl": "exact-only"}, now=1_800_000_000)
+    assert "openssl" in d4["apply"]          # "!" names never substring-match
 
 
 def test_soak_matures(tmp_path, monkeypatch):
@@ -144,3 +151,130 @@ def test_stable_digest_order_independent():
     fs = [{"target": "a", "kind": "cve-os", "package": "x", "cve": "C1", "severity": "high"},
           {"target": "b", "kind": "cve-os", "package": "y", "cve": "C2", "severity": "low"}]
     assert scan.stable_digest(fs) == scan.stable_digest(list(reversed(fs)))
+
+
+# ---- regression coverage for the 2026-11-10 adversarial-review fixes ----
+
+def test_sshd_dropin_precedence(tmp_path):        # F16: drop-in wins over main file
+    h = tmp_path / "h"
+    (h / "etc/ssh/sshd_config.d").mkdir(parents=True)
+    (h / "etc/ssh/sshd_config").write_text("Include /etc/ssh/sshd_config.d/*.conf\nPermitRootLogin no\n")
+    (h / "etc/ssh/sshd_config.d/99-hard.conf").write_text("PermitRootLogin yes\n")
+    ids = {c["check_id"] for c in bc.configbench(str(h))}
+    assert "SSH-01" in ids
+
+
+def test_auth_root_hashed_not_flagged(tmp_path):   # F8: hashed root w/ empty field 3 = no AUTH-01
+    h = tmp_path / "h"
+    (h / "etc").mkdir(parents=True)
+    (h / "etc/shadow").write_text("root:$6$abc$def:19000:0:99999:7:::\n")
+    (h / "etc/passwd").write_text("root:x:0:0:root:/root:/bin/bash\n")
+    ids = {c["check_id"] for c in bc.configbench(str(h))}
+    assert "AUTH-01" not in ids
+
+
+def test_auth_empty_root_and_uid0(tmp_path):       # F7/F8 true positives
+    h = tmp_path / "h"
+    (h / "etc").mkdir(parents=True)
+    (h / "etc/shadow").write_text("root::19000:0:99999:7:::\n")
+    (h / "etc/passwd").write_text("root:x:0:0::/root:/bin/bash\nadmin:x:0:0::/home/admin:/bin/bash\n")
+    checks = bc.configbench(str(h))
+    ids = {c["check_id"] for c in checks}
+    assert "AUTH-01" in ids
+    assert "AUTH-02" in ids and any("admin" in c["description"] for c in checks)
+    # a pwd-change date of 0 must NOT read as UID 0
+    (h / "etc/passwd").write_text("root:x:0:0::/root:/bin/bash\nsvc:x:1000:1000::/srv:/bin/sh\n")
+    (h / "etc/shadow").write_text("root:!:19000:0:99999:7:::\nsvc:!:0:0:99999:7:::\n")
+    ids2 = {c["check_id"] for c in bc.configbench(str(h))}
+    assert "AUTH-02" not in ids2
+
+
+def test_config_findings_dedupe_keeps_instances():  # F9: watch_key includes evidence
+    import scan
+    fs = [{"target": "h", "kind": "config-check", "check_id": "PERM-01", "severity": "high",
+           "description": "/etc/ssh is world-writable", "key_suffix": "/etc/ssh"}
+          for _ in range(1)] + [
+          {"target": "h", "kind": "config-check", "check_id": "PERM-01", "severity": "high",
+           "description": "/etc is world-writable", "key_suffix": "/etc"}]
+    assert len({scan.watch_key(f) for f in fs}) == 2
+
+
+def test_digest_rotates_on_kev_flip():             # F17
+    import scan
+    f1 = {"target": "h", "kind": "cve-os", "package": "x", "cve": "CVE-1", "severity": "high", "kev": False}
+    f2 = dict(f1, kev=True)
+    assert scan.stable_digest([f1]) != scan.stable_digest([f2])
+
+
+def test_policy_pending_cleared_on_apply(tmp_path, monkeypatch):  # F19
+    monkeypatch.setenv("BASTION_STATE", str(tmp_path))
+    import importlib; importlib.reload(policy)
+    fnd = [{"kind": "cve-os", "package": "curl", "target": "t", "cve": "C",
+            "severity": "critical", "cvss": 9.8, "kev": True, "pub": ""}]
+    policy.decide(fnd, cfg={"soak": 3600, "cvss": 9.0}, incidents={}, now=1_000_000_000)
+    st = json.loads((tmp_path / "fix-policy.json").read_text())
+    assert "curl" not in st["pending"]            # applied path must not linger
+    importlib.reload(policy)
+
+
+def test_ssh_target_option_injection_rejected():   # S3: '-oProxyCommand=...' hosts refused
+    import scan
+    r = scan.scan_ssh_target("evil", {"host": "-oProxyCommand=touch /tmp/pwn"})
+    assert r["meta"]["os"] == "ssh-fail"
+    assert any(f["kind"] == "scan-gap" for f in r["findings"])
+
+
+def test_baseline_no_flap_alerts(tmp_path):        # F18: gone-then-back is not 'new'
+    import scan
+    st = tmp_path
+    f = [{"target": "h", "kind": "cve-os", "package": "x", "cve": "C", "severity": "high",
+          "description": ""}]
+    new, _ = scan.diff_baseline(f, st)
+    assert new == set()                            # cold start census
+    new, _ = scan.diff_baseline([], st)            # disappears
+    assert new == set()
+    new, _ = scan.diff_baseline(f, st)             # comes back
+    assert new == set()                            # ever-baseline: never alerts twice
+
+
+def test_pack_skips_symlink_plants(tmp_path):      # S2: cron.d symlink to key material
+    h = tmp_path / "h"
+    (h / "etc/cron.d").mkdir(parents=True)
+    (h / "secret").write_text("PRIVATE-KEY-BYTES")
+    (h / "etc/cron.d/job").symlink_to(h / "secret")
+    (h / "etc/cron.d/real").write_text("0 * * * * root true\n")
+    tgz = tmp_path / "s.tgz"
+    bc.pack_inventory(str(h), tgz)
+    with tarfile.open(tgz) as tf:
+        names = tf.getnames()
+        assert "host/etc/cron.d/real" in names
+        assert not any("job" in n for n in names)
+        assert b"PRIVATE-KEY-BYTES" not in b"".join(
+            tf.extractfile(m).read() for m in tf.getmembers() if m.isfile())
+
+
+def test_debian_point_release_queries_serie():     # F2: Debian:12.5 must query Debian:12
+    # offline: we only assert the ecosystem string built into the query body
+    captured = {}
+    import urllib.request as ur
+    real = ur.urlopen
+    class Resp:
+        def read(self): return b'{"results": []}'
+    def fake(req, timeout=None):
+        captured.setdefault("bodies", []).append(req.data)
+        return Resp()
+    ur.urlopen = fake
+    try:
+        bc.osv_batch([("bash", "5.0")], "Debian", "12.5")
+    finally:
+        ur.urlopen = real
+    body = json.loads(captured["bodies"][0])
+    assert body["queries"][0]["package"]["ecosystem"] == "Debian:12"
+
+
+def test_host_os_codename_resolution(tmp_path):    # F3: sid / no VERSION_ID still scans
+    h = tmp_path / "sid"
+    (h / "etc").mkdir(parents=True)
+    (h / "etc/os-release").write_text('ID=debian\nVERSION_CODENAME=sid\n')
+    name, ver, key = bc.host_os(str(h))
+    assert (name, ver) == ("Debian", "unstable")

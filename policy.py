@@ -83,7 +83,7 @@ def cache_get_or_fetch(path, ttl, url):
     if c is None:
         c = http_json(url, 30)
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        tmp = Path(str(path) + ".tmp")
+        tmp = Path(f"{path}.tmp.{os.getpid()}")
         tmp.write_text(json.dumps(c))
         os.replace(tmp, path)
     return c
@@ -101,8 +101,8 @@ def load():
 
 def save(st):
     STATE.mkdir(parents=True, exist_ok=True)
-    tmp = STATE / "fix-policy.json.tmp"
-    tmp.write_text(json.dumps(st, indent=1, default=str))
+    tmp = STATE / f"fix-policy.json.tmp.{os.getpid()}"   # unique + replace: never
+    tmp.write_text(json.dumps(st, indent=1, default=str))  # in-place, never followed links
     os.replace(tmp, STATE / "fix-policy.json")
 
 
@@ -142,27 +142,41 @@ def decide(findings, cfg=None, incidents=None, now=None):
             g["pub"] = p
 
     def urgent(g):
-        # parity with the internal engine (2026-11-10): KEV OR (critical AND cvss>=X).
+        # parity with the shipped engine (2026-11-10): KEV OR (critical AND cvss>=X).
         # A bare critical label with no score soaks 48h.
         return bool(g["kev"] or (g["sev"] == "critical" and g["score"] >= cfg["cvss"]))
+
+    def incident_hit(pkg):
+        # "!"-prefixed names (GH feed, or your yaml entries marked exact) match
+        # exactly; plain curated names match as substrings both ways, len>=4 —
+        # so 'liblzma' covers liblzma5 etc. Same semantics as the shipped engine.
+        lo = pkg.lower()
+        v = incidents.get(lo) or incidents.get("!" + lo)
+        if v:
+            return v
+        return next((val for k, val in incidents.items()
+                     if not k.startswith("!") and len(k) >= 4 and (k in lo or lo in k)), None)
 
     apply_set, deferred, pending = set(), [], {}
     for pkg, g in grouped.items():
         prior = st["pending"].get(pkg)
         first_seen = prior["first_seen"] if prior else now
         start = max(first_seen, g["pub"]) if g["pub"] else first_seen
-        hit = incidents.get(pkg.lower()) or incidents.get("!" + pkg.lower())
+        hit = incident_hit(pkg)
         if hit:
             reason = ("URGENT but under supply-chain incident watch (" + hit + ") - review manually"
                       if urgent(g) else "supply-chain incident watch: " + hit)
             eta = None
         elif urgent(g):
             apply_set.add(pkg)
-            # keep the pending entry; note_applied()/pruning clears it once the
-            # upgrade actually lands (no apt candidate = retried next run)
+            # entered the apply path: drop it from the queue. If the upgrade
+            # lands, done; if not, the next scan re-adds it fresh. A state
+            # machine, not a comment, keeps 'pending' honest (F19).
+            st["pending"].pop(pkg, None)
             continue
         elif now - start >= cfg["soak"]:
-            apply_set.add(pkg)  # matured; same bookkeeping as above
+            apply_set.add(pkg)
+            st["pending"].pop(pkg, None)
             continue
         else:
             reason = "%sh soak (fix published %s, seen %s)" % (

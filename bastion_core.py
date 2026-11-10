@@ -10,7 +10,7 @@ import json, os, re, shutil, subprocess, sys, tarfile, time, urllib.parse, urlli
 from io import BytesIO
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 STATE = Path(os.environ.get("BASTION_STATE", "/data"))
 STATE.mkdir(parents=True, exist_ok=True)
 CACHE_TTL = int(os.environ.get("BASTION_CACHE_DAYS", "7")) * 86400
@@ -49,10 +49,13 @@ def cache_get(path, ttl):
 
 
 def cache_put(path, obj):
-    """Atomic write so a crash mid-write can't corrupt a cache the next run trusts."""
+    """Atomic write so a crash mid-write can't corrupt a cache the next run
+    trusts. Unique temp name + replace (not in-place write): replace swaps the
+    directory entry, so an attacker-planted symlink at the final path is
+    swapped out, never followed. Never write state files open(path,'w') as root."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp = p.with_name(f"{p.name}.tmp.{os.getpid()}")
     tmp.write_text(json.dumps(obj))
     os.replace(tmp, p)
 
@@ -101,19 +104,28 @@ def dpkg_cmp(a, b):
 
 # --------------------------------------------------------------- distro + inventory
 
+UBUNTU_COD = {"focal": "20.04", "jammy": "22.04", "noble": "24.04", "oracular": "24.10",
+              "plucky": "25.04", "questing": "25.10", "resolute": "26.04"}
+DEBIAN_COD = {"bullseye": "11", "bookworm": "12", "trixie": "13", "forky": "14", "sid": "unstable"}
+
 def host_os(host="/host"):
-    """-> (name, version, eco_key). eco_key feeds OSV ecosystem queries."""
+    """-> (name, version, eco_key). eco_key feeds OSV ecosystem queries.
+    VERSION_ID is preferred; unversioned releases (sid, some Ubuntu flavours)
+    resolve via VERSION_CODENAME so they scan instead of silently skipping."""
     try:
         txt = (Path(host) / "etc/os-release").read_text(errors="replace")
     except Exception:
         return None, None, "unknown"
     kv = dict(re.findall(r'^(\w+)="?([^"\n]*)"?', txt, re.M))
     iid, ver = kv.get("ID", "").lower(), kv.get("VERSION_ID", "")
+    code = (kv.get("VERSION_CODENAME") or kv.get("UBUNTU_CODENAME") or "").lower()
     like = kv.get("ID_LIKE", "")
     allids = iid + " " + like
     if "ubuntu" in allids:
+        ver = ver or UBUNTU_COD.get(code, "")
         return "Ubuntu", ver, f"ubuntu-{ver}"
     if "debian" in allids or iid in ("proxmox",):
+        ver = ver or DEBIAN_COD.get(code, "")
         return "Debian", ver, f"debian-{ver}"
     if iid in ("fedora",) or "fedora" in like:
         return "Fedora", ver, f"fedora-{ver}"
@@ -159,7 +171,8 @@ def rpm_inventory(host="/host"):
         head = db.open("rb").read(16)
         if head.startswith(b"SQLite format 3"):
             try:
-                con = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
+                con = sqlite3.connect("file:" + urllib.parse.quote(str(db)) +
+                                      "?mode=ro&immutable=1", uri=True)
                 for n, v, r in con.execute(
                     "select name,version,release from (select * from packages order by dbid)"):
                     pkgs[n] = f"{v}-{r}"
@@ -220,6 +233,8 @@ def inventory_distro_pkgs(host="/host"):
 # ---------------------------------------------------------------------- KEV
 
 def kev_set():
+    """-> (set of CVE ids, note). note warns when the KEV feed is stale/offline —
+    a silent empty set would make the exit-10 KEV gate quietly inert forever."""
     f = STATE / "kev.json"
     c = cache_get(f, 86400)
     if c is None:
@@ -227,23 +242,40 @@ def kev_set():
             j = http_json("https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json", 60)
             c = sorted(v["cveID"] for v in j.get("vulnerabilities", []))
             cache_put(f, c)
+            return set(c), ""
         except Exception:
-            return set()
-    return set(c)
+            c = cache_get(f, 7 * 86400)         # stale cache beats no cache
+            if c is not None:
+                return set(c), ("KEV feed unreachable; using a cached copy older than 24h "
+                                "— known-exploited matching may lag")
+            return set(), ("CISA KEV feed could not be fetched (offline or blocked): "
+                           "known-exploited vulnerabilities were NOT matched on this run")
+    return set(c), ""
 
 
 # ---------------------------------------------------------------------- OSV
 
 def osv_batch(pairs, eco, rel):
-    """[(pkg,ver)] -> {pkg: [(cve, fixed, sev, score, published)]}.
+    """[(pkg,ver)] -> ({pkg: [(cve, fixed, sev, score, published)]}, note).
     Semantics (do not 'simplify' — each line was learned expensively):
     - querybatch does NOT fully version-filter; post-filter ECOSYSTEM fixed events.
+    - Ubuntu/Debian want the RELEASE SERIE, not the point release: OSV's
+      ecosystem is 'Debian:12', and querying 'Debian:12.5' returns ZERO results
+      with no error (a whole distro scanning silently clean — worse than broken).
     - Ubuntu records: no fixed events; a hit = genuinely affected. versions lists are
       every version ever shipped, so membership tests there are meaningless.
     - Match affected entries by ECOSYSTEM ONLY (Ubuntu vulns span sibling packages).
     - Severity: Ubuntu/Debian bucket field first, then ecosystem urgency, then CVSS.
-    - Skip linux-* meta packages (flood ~1000 hits); keep linux-libc-dev."""
+    - Skip linux-* meta packages (flood ~1000 hits); keep linux-libc-dev.
+    note is '' or a scan-gap string (e.g. 'OSV returned zero results for
+    Debian:12.5 across 400 packages' — never let a silent zero look like clean)."""
     out = {}
+    if eco == "Debian":
+        # OSV's Debian ecosystem is the SERIE ('Debian:12'); 'Debian:12.5' is a
+        # valid-looking but DATALESS ecosystem that returns zero with no error.
+        # Ubuntu is the opposite: 'Ubuntu:24.04' IS the ecosystem — truncating
+        # the point release there silently kills every hit (verified 2026-11-11).
+        rel = str(rel).split(".")[0] if str(rel).split(".")[0].isdigit() else rel
     pairs = [(p, v) for p, v in pairs
              if p == "linux-libc-dev" or not (p.startswith("linux-") or p.endswith("-source"))]
     VCACHE = STATE / "vulncache.json"
@@ -251,6 +283,7 @@ def osv_batch(pairs, eco, rel):
     if cache and not any("pub" in v for v in cache.values()):
         cache = {}                              # pre-0.2 shape: rebuild, don't trust
     want = f"{eco}:{rel}"
+    batch_fail = 0
     queries = [{"package": {"name": p, "ecosystem": want}, "version": v} for p, v in pairs]
     hits = {}
     for i in range(0, len(queries), 100):
@@ -264,6 +297,7 @@ def osv_batch(pairs, eco, rel):
                 if ids:
                     hits[q["package"]["name"]] = (q["version"], ids)
         except Exception as e:
+            batch_fail += 1
             print(f"OSV batch fail: {str(e)[:80]}", file=sys.stderr)
     todo = sorted({vid for _, ids in hits.values() for vid in ids if vid not in cache})
     cap = int(os.environ.get("BASTION_OSV_DETAIL_MAX", "400"))
@@ -305,7 +339,8 @@ def osv_batch(pairs, eco, rel):
             cache_put(VCACHE, cache)
     cache_put(VCACHE, cache)
     umap = {"not yet assigned": "medium", "unimportant": "low", "end-of-life": "low",
-            "whacked": "low", "highest": "critical", "high": "high", "medium": "medium", "low": "low"}
+            "whacked": "low", "draft": "low", "highest": "critical", "high": "high",
+            "medium": "medium", "low": "low"}
     for pkg, (ver, ids) in hits.items():
         rows = []
         for vid in ids:
@@ -326,7 +361,11 @@ def osv_batch(pairs, eco, rel):
                          meta.get("score", 0), meta.get("pub", "")))
         if rows:
             out[pkg] = rows
-    return out
+    note = ""
+    if pairs and batch_fail:
+        note = (f"{batch_fail} OSV batch query(ies) for {want} FAILED (network/API): some of the "
+                f"{len(pairs)} packages were NOT checked — CVE results here are incomplete")
+    return out, note
 
 
 # ------------------------------------------------------------- network probing
@@ -334,34 +373,47 @@ def osv_batch(pairs, eco, rel):
 SAFE_NAME = re.compile(r"^[A-Za-z0-9._+:@/~-]{1,255}$")
 
 def probe_urls(urls):
-    """-> {url: {"code", "tls_expiry_days"}}. TLS cert expiry is checked via
-    openssl s_client (present in the container image)."""
+    """-> {url: {"code", "tls_expiry_days"}}. HTTP status via urllib (stdlib —
+    works even in the minimal container and on the no-pip fleet path); TLS cert
+    expiry via `openssl s_client`, parsing its STDOUT -3.x format (openssl 3.x
+    prints `NotAfter: ...` there, not `notAfter=` on stderr)."""
+    import datetime as dt
+    import urllib.error
     out = {}
     for u in urls:
         rec = {"code": "000", "tls_expiry_days": None}
         try:
-            if not SAFE_NAME.match(u):
+            if not SAFE_NAME.match(u) or urllib.parse.urlparse(u).scheme not in ("http", "https"):
                 rec["code"] = "bad-url"
                 out[u] = rec
                 continue
-            code = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-                                   "-m", "12", "-L", "--", u],
-                                  capture_output=True, text=True).stdout.strip() or "000"
-            rec["code"] = code
+            req = urllib.request.Request(u, headers={"User-Agent": UA}, method="GET")
+            try:
+                resp = urllib.request.urlopen(req, timeout=12)
+                rec["code"] = str(resp.getcode())
+                resp.read(1)
+            except urllib.error.HTTPError as e:
+                rec["code"] = str(e.code)
         except Exception:
-            pass
+            rec["code"] = "000"
         if u.startswith("https://"):
             try:
                 host_ = urllib.parse.urlsplit(u).hostname
                 port = urllib.parse.urlsplit(u).port or 443
                 p = subprocess.run(
-                    ["openssl", "s_client", "-servername", host_, "-connect", f"{host_}:{port}"],
+                    ["openssl", "s_client", "-servername", host_, "-connect", f"{host_}:{port}",
+                     "-no_ign_eof"],
                     input=b"", capture_output=True, timeout=12)
-                m = re.search(rb"notAfter=(.*\n)", p.stderr)
+                blob = p.stdout
+                m = re.search(rb"notAfter=(.*?)\r?\n", blob) or \
+                    re.search(rb"NotAfter:\s*(.*?)\s+GMT", blob)
                 if m:
                     from email.utils import parsedate_to_datetime
-                    import datetime as dt
-                    exp = parsedate_to_datetime(m.group(1).decode(errors="replace").strip())
+                    try:
+                        exp = parsedate_to_datetime(m.group(1).decode(errors="replace").strip())
+                    except ValueError:   # openssl 3.x: 'Jan 27 23:59:59 2027' (no weekday)
+                        exp = dt.datetime.strptime(m.group(1).decode(errors="replace").strip(),
+                                                   "%b %d %H:%M:%S %Y").replace(tzinfo=dt.timezone.utc)
                     rec["tls_expiry_days"] = (exp - dt.datetime.now(dt.timezone.utc)).days
             except Exception:
                 pass
@@ -375,8 +427,10 @@ def listeners(host="/host"):
     and this shows the HOST's sockets even though the container has its own
     netns. If /proc is absent (partial mount) you get [] — a scan-gap, not clean."""
     out = set()
+    # tcp6 hex is 4 little-endian words per 16 bytes: :: = 32 zeros;
+    # ::ffff:0.0.0.0 (docker's userland-proxy bind) = FFFF at word index 2.
     for f, wcard in (("tcp", {"00000000"}), ("tcp6", {"00000000000000000000000000000000",
-                                                     "00000000000000000000FFFF00000000"})):
+                                                     "0000000000000000FFFF000000000000"})):
         p = Path(host) / f"proc/net/{f}"
         try:
             for line in p.read_text().splitlines()[1:]:
@@ -403,12 +457,17 @@ def _read(host, *parts):
 
 
 def _ssh_config_value(host, key):
-    """Effective sshd value: ssh_config.d-style drops + sshd_config, first match wins
-    (sshd semantics: first obtained value wins). Returns None if not set (=distro default)."""
-    texts = [_read(host, "etc", "ssh", "sshd_config")]
+    """Effective sshd value WITHOUT running sshd -T (that would execute a host
+    binary). sshd semantics: for each directive the FIRST obtained value wins,
+    and `Include` lines splice drop-in files in at the point the Include appears
+    — on stock Ubuntu/Debian that Include sits at the TOP of sshd_config, so the
+    drop-ins win over anything in the main file. Approximation that never false-cleans:
+    scan the drop-ins first, then the main file."""
+    texts = []
     d = Path(host) / "etc/ssh/sshd_config.d"
     if d.is_dir():
         texts += [f.read_text(errors="replace") for f in sorted(d.glob("*.conf"))]
+    texts.append(_read(host, "etc", "ssh", "sshd_config"))
     for t in texts:
         m = re.search(rf"^\s*{key}\s+(\S+)", t, re.M | re.I)
         if m:
@@ -420,9 +479,13 @@ def configbench(host="/host"):
     """-> list of finding dicts (kind=config-check)."""
     out = []
     hname = Path(host).name or "host"
-    def add(cid, sev, desc, fix, evidence):
+    def add(cid, sev, desc, fix, evidence, key_suffix=""):
+        # key_suffix disambiguates checks that legitimately fire N times
+        # (PERM-01 on five dirs): without it, dedupe eats the extras and
+        # 'resolved' would lie about the rest.
         out.append({"target": hname, "kind": "config-check", "check_id": cid,
-                    "severity": sev, "description": desc, "fix": fix, "evidence": evidence})
+                    "severity": sev, "description": desc, "fix": fix, "evidence": evidence,
+                    "key_suffix": key_suffix})
 
     # sshd
     if _ssh_config_value(host, "PermitRootLogin") == "yes":
@@ -438,7 +501,7 @@ def configbench(host="/host"):
         fp = Path(host) / p.lstrip("/")
         try:
             if fp.is_dir() and (fp.stat().st_mode & 0o022):
-                add("PERM-01", "high", f"{p} is world-writable", "chmod o-w", str(fp.stat().st_mode & 0o777))
+                add("PERM-01", "high", f"{p} is world-writable", "chmod o-w", str(fp.stat().st_mode & 0o777), p)
         except Exception:
             pass
     try:
@@ -465,28 +528,30 @@ def configbench(host="/host"):
     for f in sorted((Path(host) / "etc/cron.d").glob("*")) if (Path(host) / "etc/cron.d").is_dir() else []:
         try:
             if f.stat().st_mode & 0o022:
-                add("CRON-01", "high", f"{f} world-writable cron file", "chmod go-w", str(f))
+                add("CRON-01", "high", f"{f} world-writable cron file", "chmod go-w", str(f), str(f))
         except Exception:
             pass
 
-    # empty root password (needs shadow readable; scanner container runs as root)
+    # empty root password: field 2 of root's shadow line, exactly empty
+    # (a bare regex like ^root:[^:!]*:: false-positives on a HASHED password
+    # whose next field happens to be empty, and false-negatives the real "" case)
     shadow = _read(host, "etc", "shadow")
-    if re.search(r"^root:[^:!]*::", shadow, re.M):
-        add("AUTH-01", "critical", "root password hash is empty", "passwd root", "/etc/shadow")
     for line in shadow.splitlines():
         parts = line.split(":")
-        if len(parts) > 6 and parts[2] == "0" and parts[0] != "root":
-            add("AUTH-02", "high", f"non-root UID 0 account: {parts[0]}", "userdel or give it a unique uid", "/etc/passwd")
-    # accounts that can log in with NO password: authoritative check is
-    # shadow's empty hash field (passwd's x just means "see shadow").
-    try:
-        for line in (Path(host) / "etc/shadow").read_text(errors="replace").splitlines():
-            parts = line.split(":")
-            if len(parts) > 1 and parts[1] == "" and parts[0] not in ("sync", "halt", "shutdown"):
-                add("AUTH-03", "medium", f"account {parts[0]} has no password (logs in without one)",
-                    "lock it: passwd -l " + parts[0], "/etc/shadow")
-    except Exception:
-        pass
+        if len(parts) < 2:
+            continue
+        if parts[0] == "root" and parts[1] == "":
+            add("AUTH-01", "critical", "root password hash is empty", "passwd root", "/etc/shadow")
+        if parts[1] == "" and parts[0] not in ("root", "sync", "halt", "shutdown"):
+            add("AUTH-03", "medium", f"account {parts[0]} has no password (logs in without one)",
+                "lock it: passwd -l " + parts[0], f"/etc/shadow:{parts[0]}")
+    # non-root UID 0 lives in /etc/passwd field 3 — shadow field 3 is the
+    # last-password-change date, an old check here read the wrong file
+    for line in _read(host, "etc", "passwd").splitlines():
+        parts = line.split(":")
+        if len(parts) > 2 and parts[2] == "0" and parts[0] != "root":
+            add("AUTH-02", "high", f"non-root UID 0 account: {parts[0]}",
+                "userdel or give it a unique uid", f"/etc/passwd:{parts[0]}")
 
     # core dumps setuid
     try:
@@ -523,30 +588,43 @@ def scan_host(host="/host", do_configbench=True):
     res["pkg_format"] = fmt
     if fmt:
         res["packages"] = len(pkgs)
-        kev = kev_set()
-        vulns = {}
+        kev, _knote = kev_set()
+        vulns, note = {}, ""
         if eco in ("Ubuntu", "Debian") and rel:
-            vulns = osv_batch(sorted(pkgs.items()), eco, rel)
-        elif eco.startswith("fedora-") or eco.startswith("rhat-"):
-            # OSV has Fedora/Rocky/Alma data under distinct ecosystems; try the
-            # closest one — zero hits is handled as a scan-gap below.
-            fam, _, ver_ = eco.split("-", 2)
-            eco_name = {"fedora": "Fedora", "rocky": "Rocky Linux", "almalinux": "AlmaLinux"}.get(fam)
+            vulns, note = osv_batch(sorted(pkgs.items()), eco, rel)
+        elif oskey.startswith("fedora-") or oskey.startswith("rhat-"):
+            # OSV keeps Fedora/Rocky/Alma under distinct ecosystems keyed by the
+            # ID (host_os's eco_key), NOT the display name — branch on oskey.
+            fam, _, ver_ = oskey.split("-", 2)
+            eco_name = {"fedora": "Fedora", "rocky": "Rocky Linux", "almalinux": "AlmaLinux",
+                        "centos": "CentOS", "rhel": "Red Hat Enterprise Linux",
+                        "amzn": "Amazon Linux"}.get(fam)
             if eco_name and ver_:
-                vulns = osv_batch(sorted(pkgs.items()), eco_name, ver_)
+                vulns, note = osv_batch(sorted(pkgs.items()), eco_name, ver_)
+        if note:
+            res["error"] = note
         for pkg, lst in vulns.items():
             for cve, fixed, sev, score, pub in lst:
                 res["findings"].append({"target": Path(host).name, "kind": "cve-os", "package": pkg,
                                         "installed": pkgs.get(pkg, ""), "cve": cve, "fix": fixed,
                                         "severity": sev, "cvss": score, "kev": cve in kev, "pub": pub})
-        if fmt == "rpm" and eco not in ("Ubuntu", "Debian") and not vulns and pkgs:
+        if fmt == "rpm" and not vulns and pkgs and not note:
             res["error"] = f"distro '{eco}' has {len(pkgs)} rpm packages but no OSV coverage here; use trivy targets for it"
-    elif eco in ("Ubuntu", "Debian") or eco.startswith(("fedora", "rhat")):
-        res["error"] = "package database unreadable (mount missing or partial)"
-    elif eco and eco != "unknown":
-        res["error"] = f"distro '{eco}' not covered by the OSV path (use trivy targets for it)"
-    else:
+        if fmt == "dpkg" and eco in ("Ubuntu", "Debian") and not rel:
+            res["error"] = (f"{eco} release is unversioned and the codename is unknown — "
+                            "package CVE checks were SKIPPED on this box")
+        if eco is None or eco == "unknown":
+            res["error"] = ("no /etc/os-release: distro unknown, package CVE checks were SKIPPED "
+                            "(check the mount/transport)")
+    elif (eco in ("Ubuntu", "Debian", "Fedora") or oskey.startswith(("fedora", "rhat"))
+          or (eco and eco != "unknown")):
+        res["error"] = ("package database unreadable (mount missing or partial)" if eco in
+                        ("Ubuntu", "Debian", "Fedora") or oskey.startswith(("fedora", "rhat"))
+                        else f"distro '{eco}' not covered by the OSV path (use trivy targets for it)")
+    elif eco is None:
         res["error"] = "no /host mount or /etc/os-release"
+    else:
+        res["error"] = "no readable package database"
     if do_configbench:
         res["findings"].extend(configbench(host))
     return res
@@ -563,10 +641,11 @@ def mark_fixable(res, host="/host"):
         return res
     for i in range(0, len(pkgs), 80):
         try:
-            p = subprocess.run(["chroot", host, "apt-get", "-s", "--only-upgrade", "-y"] + pkgs[i:i + 80],
+            p = subprocess.run(["chroot", host, "apt-get", "-s", "install", "--only-upgrade", "--"]
+                               + pkgs[i:i + 80],
                                capture_output=True, text=True, timeout=120)
-            fixable |= {m.group(1).rstrip(":anyarch") for m in
-                        re.finditer(r"^Inst (\S+) \[[^\]]*\] \((\S+)", p.stdout, re.M)}
+            fixable |= {m.group(1) for m in
+                        re.finditer(r"^Inst (\S+)(?::\S+)? \[[^\]]*\] \((\S+)", p.stdout, re.M)}
         except Exception:
             pass
     for f in res["findings"]:
@@ -587,15 +666,23 @@ EXCLUDE = re.compile(r"(^|/)(.+key.*|.*\.pem|shadow\.old)$")
 
 
 def _tar_add_file(tf, f, arcname):
-    """procfs files stat as size 0 — read the bytes or we'd pack empties."""
+    """procfs files stat as size 0 — read the bytes or we'd pack empties.
+    Symlinks are NEVER followed or packed: a low-priv user who can write a
+    globbed dir (etc/cron.d etc) could otherwise plant a link to /root/id_rsa
+    and have root's packer ship the bytes under an innocent-looking name."""
     try:
+        if f.is_symlink():
+            return
         data = f.read_bytes()
     except Exception:
         return
     ti = tarfile.TarInfo(arcname)
     ti.size = len(data)
     ti.mtime = 0
-    ti.mode = f.stat().st_mode & 0o7777
+    try:
+        ti.mode = f.stat().st_mode & 0o7777
+    except OSError:
+        ti.mode = 0o600
     tf.addfile(ti, BytesIO(data))
 
 

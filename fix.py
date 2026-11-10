@@ -25,6 +25,7 @@ import policy
 
 STATE = Path(os.environ.get("BASTION_STATE", "/data"))
 HOST = os.environ.get("BASTION_HOST", "/host")
+PKG_NAME = re.compile(r"^[a-z0-9][a-z0-9+.\-]{1,78}(:[a-z0-9\-]{1,30})?$")  # Debian policy charset
 
 
 def gate(dry):
@@ -47,7 +48,11 @@ def gate(dry):
 
 def apt(pkgs, simulate=True):
     sfx = ["-s"] if simulate else ["-y"]
-    cmd = ["chroot", HOST, "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "--only-upgrade"] + sfx + pkgs
+    # 'apt-get --only-upgrade X' is NOT a valid invocation (no subcommand: apt
+    # errors out and the fixer silently no-ops — verified). The real shape is
+    # 'install --only-upgrade', and '--' pins the rest as subjects, not options.
+    cmd = ["chroot", HOST, "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install",
+           "--only-upgrade"] + sfx + ["--"] + pkgs
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
     return p.stdout + p.stderr, p.returncode
 
@@ -70,11 +75,16 @@ def main(argv=None):
         scan = json.loads((STATE / "last-scan.json").read_text())
     except Exception:
         print("no state/last-scan.json — run the scanner first"); return 2
-    # scope to THIS host only (multi-target scans share one last-scan.json)
-    host_name = Path(HOST).name if HOST != "/" else "host"
+    # scope to THIS host only (multi-target scans share one last-scan.json).
+    # NO fallback-to-everything: findings about other machines (ssh fleet
+    # targets, images, or a planted last-scan.json) must never drive apt here.
+    host_name = (Path(HOST).name or "host").lower()
     scoped = [f for f in scan["findings"]
-              if str(f.get("target", "")).split("|")[-1].lower() in (host_name.lower(), "local-host", "host")] \
-             or [f for f in scan["findings"]]
+              if str(f.get("target", "")).split("|")[-1].lower() in (host_name, "local-host", "host")]
+    if not scoped:
+        print("no findings scoped to this host; nothing to do "
+              "(run the scanner against this machine first)")
+        return 0
     decision = policy.decide(scoped)
     vuln_pkgs = sorted(decision["apply"] & {f["package"] for f in scoped
                                            if f["kind"] == "cve-os" and f.get("package")})
@@ -84,12 +94,13 @@ def main(argv=None):
     if not vuln_pkgs:
         print("nothing to fix"); return 0
     apt_update()
+    vuln_pkgs = [p for p in vuln_pkgs if PKG_NAME.match(p)]   # argv-safe: no '-option', no paths
     dry, rc = apt(vuln_pkgs, simulate=True)
     if re.search(r"The following packages will be REMOVED", dry, re.I):
         print("ABORT: apt's plan would remove packages. Manual review needed. Dry-run tail:\n", dry[-600:])
         return 3
-    upgrade_pkgs = [m.group(1).rstrip(":anyarch") for m in
-                    re.finditer(r"^Inst (\S+) \[[^\]]*\] \((\S+)", dry, re.M)]
+    upgrade_pkgs = [m.group(1) for m in
+                    re.finditer(r"^Inst (\S+)(?::\S+)? \[[^\]]*\] \((\S+)", dry, re.M)]
     if not upgrade_pkgs:
         print("0 packages have an apt candidate right now; findings are upstream-unfixed. Nothing done.")
         return 0
@@ -100,8 +111,10 @@ def main(argv=None):
         return 0
     out, arc = apt(upgrade_pkgs, simulate=False)
     ok = arc == 0 and "\nE:" not in out
-    STATE.mkdir(exist_ok=True)
-    with open(STATE / "journal.jsonl", "a") as f:
+    STATE.mkdir(parents=True, exist_ok=True)
+    jpath = STATE / "journal.jsonl"
+    fd = os.open(jpath, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "a") as f:   # O_NOFOLLOW: a planted symlink can't redirect root's audit log
         f.write(json.dumps({"ts": int(time.time()), "action": "apt-only-upgrade", "host": "mounted",
                             "ok": ok, "packages": upgrade_pkgs, "output_tail": out[-300:]}) + "\n")
     print("done, journal at", STATE / "journal.jsonl", "" if ok else "BUT apt errored; see journal")

@@ -1,5 +1,58 @@
 # Changelog
 
+## v0.2.1 — 2026-11-11 (adversarial-review pass)
+
+Every finding from two independent code reviews (offensive security +
+correctness) is closed, with regression tests for each:
+
+Security
+- All state/report writes are atomic replace (unique temp name); nothing is
+  written in-place by the root-privileged scanner, so a planted symlink in the
+  data dir can no longer turn a scan into a host root-write (local privesc).
+- Fixer journal opens with O_NOFOLLOW + 0600.
+- ssh fleet: host/user validated against a pinned charset — `-oProxyCommand=…`
+  style config values are rejected instead of reaching ssh's argv (RCE).
+  Remote temp inventory is O_EXCL (`set -C`) + unique; stale inventories are
+  deleted before collect (a dead ssh can't pass as last week's clean scan).
+- pack_inventory never follows symlinks (a plant in a globbed dir couldn't
+  ship key material under an innocent name); fleet inventory tarball is pruned
+  after scan so shadow hashes don't linger world-readable on the volume.
+- sqlite URIs from remote filenames are quoted (`?` in a name can't drop
+  mode=ro); apt/chroot package argv is `--`-terminated + Debian-charset
+  validated (dash-prefixed names can't become apt options).
+- State dir gets a 0750 default mode; webhook URLs scheme-gated.
+
+Correctness
+- FIXER WAS A NO-OP: `apt-get --only-upgrade X` is not a valid command.
+  Now `apt-get install --only-upgrade --` (verified against a live dpkg tree).
+- Debian point releases queried OSV as `Debian:12.5` = ZERO results, silent
+  false-clean. Queries now use the serie (`Debian:12`); Ubuntu keeps its
+  point-release ecosystem (verified both directions).
+- Fedora/Rocky/Alma branch tested the wrong value (display name vs eco key) —
+  was dead code; RPM distros now actually hit OSV, still gap-flagged on zero.
+- Unversioned/codename-only releases (Debian sid) resolve via codename maps;
+  anything that still can't be versioned emits a scan-gap, never a pass.
+- Fixed OS-scoped fixer fallback that could apt-upgrade packages named by
+  OTHER machines' findings: scope mismatch now means do nothing.
+- AUTH-01/Auth-03 parse shadow field 2 exactly (was a regex that
+  false-positives on hashed root, false-negatives the empty case); AUTH-02
+  reads /etc/passwd UID, not shadow's date field.
+- sshd drop-ins beat sshd_config (Include-first distro layouts) — no more
+  false-clean PermitRootLogin.
+- KEV membership now rotates the digest and re-alerts (a CVE flipping to
+  known-exploited was previously invisible); resolved→reappears no longer
+  re-alerts (permanent ever-baseline); policy queue entries clear when a pkg
+  enters the apply path; alert filter honours the documented NEW-KEV contract.
+- config-check dedupe keeps per-path instances (5 world-writable dirs = 5
+  findings); trivy nonzero exit is a scan-gap, not clean; trivy cache HOME
+  fixed for the read-only rootfs; url probing moved to urllib (curl is purged
+  from the image — "HTTP 000" on every URL was the result) and TLS expiry
+  parses openssl 3.x stdout (the old stderr grep was permanently dead);
+  tcp6 `::ffff:0.0.0.0` wildcard constant corrected (docker-proxy binds);
+  malformed YAML config exits 2 (config error), not 20; BASTION_EXIT_ON splits
+  on commas; KEV-feed outage emits a scan-gap instead of silently disabling
+  the KEV gate; ssh-branch package-db errors surface like the local branch.
+
 ## v0.2.0 — 2026-11-10 (the "commercial grade" pass)
 
 Added
