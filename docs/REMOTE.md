@@ -15,8 +15,8 @@ security-relevant files, and analyzes everything locally.
 ```yaml
 targets:
   - name: web01
-    ssh: 10.0.0.21
-    user: gerry          # optional; ssh default otherwise
+    ssh: host.example.com
+    user: backup          # optional; ssh default otherwise
 ```
 
 3. `docker compose run --rm fleet` (or the same scanner with this config).
