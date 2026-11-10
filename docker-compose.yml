@@ -26,5 +26,9 @@ services:
     environment:
       BASTION_FIX: "on"
       BASTION_FIX_CONFIRM: "yes-i-understand"
+      # Fix policy (docs/FIXING.md): urgent = KEV/critical/CVSS>=urgent-cvss applies now,
+      # rest waits soak-hours. Tune if you like; defaults shown.
+      BASTION_SOAK_HOURS: "48"
+      BASTION_URGENT_CVSS: "9.0"
 volumes:
   bastion-data:

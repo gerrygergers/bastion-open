@@ -51,9 +51,10 @@ stability. The fix-cache guard means stale formats can't linger.)
 
 Out of the box this tool will never change a byte on your machine. The findings
 report says exactly what to do (`docs/FIXING.md` covers the opt-in fixer,
-which is `apt --only-upgrade` with a dry-run abort guard, behind two env gates
-AND a separate compose profile, because "runs as root against your host" should
-cost you two deliberate decisions, not zero).
+which is `apt --only-upgrade` behind two env gates AND a separate compose
+profile. Even then it applies by policy: KEV/critical/CVSS≥9 immediately,
+everything else after a 48h supply-chain soak, because fresh "fixes" are where
+poisoning hides).
 
 ## What it doesn't do (yet)
 

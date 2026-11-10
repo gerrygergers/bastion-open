@@ -1,0 +1,9 @@
+# Supply-chain incident watch for the fixer policy.
+# Copy to incidents.yaml and edit when a poisoned/compromised release is out
+# (xz 2024 being the famous one). Packages listed here are NEVER auto-applied,
+# even urgent ones — the fixer holds them and says why. Set resolved: true
+# (or delete the entry) once you've vetted the replacement release yourself.
+incidents:
+  # - packages: [liblzma, xz-utils]
+  #   reason: "backdoored 5.6.0/5.6.1 releases (2024-03)"
+  #   resolved: true

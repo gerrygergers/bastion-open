@@ -118,7 +118,7 @@ def osv_batch(pairs, eco, rel):
              if p == "linux-libc-dev" or not (p.startswith("linux-") or p.endswith("-source"))]
     VCACHE = STATE / "vulncache.json"
     cache = cache_get(VCACHE, CACHE_TTL) or {}
-    if cache and not any("urg" in v for v in cache.values()):
+    if cache and not any("pub" in v for v in cache.values()):
         cache = {}
     want = f"{eco}:{rel}"
     queries = [{"package": {"name": p, "ecosystem": want}, "version": v} for p, v in pairs]
@@ -165,9 +165,10 @@ def osv_batch(pairs, eco, rel):
             sevmap = {"moderate": "medium", "negligible": "low"}
             cache[vid] = {"fixes": fixes, "urg": urg, "sev": sevmap.get(sev, sev if sev in
                         ("critical", "high", "medium", "low") else "unknown"),
-                        "score": score, "aliases": full.get("aliases", [])}
+                        "score": score, "aliases": full.get("aliases", []),
+                        "pub": full.get("published", "")}
         except Exception:
-            cache[vid] = {"fixes": [], "urg": "", "sev": "unknown", "score": 0, "aliases": []}
+            cache[vid] = {"fixes": [], "urg": "", "sev": "unknown", "score": 0, "aliases": [], "pub": ""}
         if n % 60 == 59:
             VCACHE.write_text(json.dumps(cache))
     VCACHE.write_text(json.dumps(cache))
@@ -189,7 +190,7 @@ def osv_batch(pairs, eco, rel):
                     s = meta["score"]
                     sev = "critical" if s >= 9 else "high" if s >= 7 else "medium" if s >= 4 else "low"
             cve = next((a for a in meta.get("aliases", []) if a.startswith("CVE-")), vid)
-            rows.append((cve, ",".join(fixes)[:60] or "no fix released", sev, meta.get("score", 0)))
+            rows.append((cve, ",".join(fixes)[:60] or "no fix released", sev, meta.get("score", 0), meta.get("pub", "")))
         if rows:
             out[pkg] = rows
     return out
@@ -246,10 +247,10 @@ def scan_host(host="/host"):
             kev = kev_set()
             vulns = osv_batch(sorted(pkgs.items()), eco, rel)
             for pkg, lst in vulns.items():
-                for cve, fixed, sev, score in lst:
+                for cve, fixed, sev, score, pub in lst:
                     res["findings"].append({"target": Path(host).name, "kind": "cve-os", "package": pkg,
                                             "installed": pkgs.get(pkg, ""), "cve": cve, "fix": fixed,
-                                            "severity": sev, "cvss": score, "kev": cve in kev})
+                                            "severity": sev, "cvss": score, "kev": cve in kev, "pub": pub})
         else:
             res["error"] = "dpkg status unreadable (mount missing or not a Debian/Ubuntu host)"
     elif eco and eco not in ("unknown",):

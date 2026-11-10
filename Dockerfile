@@ -8,8 +8,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
  && rm -rf /var/lib/apt/lists/* \
  && pip install --no-cache-dir pyyaml
 WORKDIR /app
-COPY scan.py fix.py bastion_core.py /app/
+COPY scan.py fix.py policy.py bastion_core.py /app/
 COPY scripts/run.sh /app/run.sh
 COPY config/config.example.yaml /app/config/config.yaml
+COPY config/incidents.example.yaml /app/config/incidents.example.yaml
 VOLUME /data
 ENTRYPOINT ["python3", "/app/scan.py"]

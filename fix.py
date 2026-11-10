@@ -3,8 +3,10 @@
   BASTION_FIX=on  AND  BASTION_FIX_CONFIRM=yes-i-understand
 and the /host mount must be READ-WRITE (fixer service in compose does that).
 
-What it does: apt-get --only-upgrade for packages that (a) have open CVEs and
-(b) apt confirms a candidate exists. What it never does: install new packages,
+What it does: apt-get --only-upgrade for packages that (a) have open CVEs,
+(b) apt confirms a candidate exists, and (c) policy.py clears: urgent fixes
+(KEV/critical/CVSS>=9) apply now, everything else soaks 48h, and packages named
+in config/incidents.yaml are held for human review. What it never does: install new packages,
 remove anything, autoremove, touch config, reboot. A dry-run abort guard stops
 any plan that would REMOVE packages. Every action -> state/journal.jsonl.
 Read state/last-scan.json from a prior scan.py run; fixable set is recomputed
@@ -13,6 +15,7 @@ import json, os, re, subprocess, sys, time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from bastion_core import read_dpkg_status, host_os, osv_batch
+import policy
 
 STATE = Path(os.environ.get("BASTION_STATE", "/data"))
 HOST = os.environ.get("BASTION_HOST", "/host")
@@ -44,7 +47,11 @@ def main():
     if not gate():
         return 2
     scan = json.loads((STATE / "last-scan.json").read_text())
-    vuln_pkgs = sorted({f["package"] for f in scan["findings"] if f["kind"] == "cve-os" and f.get("severity") in ("critical", "high", "medium", "unknown")})
+    decision = policy.decide(scan["findings"])
+    vuln_pkgs = sorted(decision["apply"] & {f["package"] for f in scan["findings"] if f["kind"] == "cve-os"})
+    if decision["deferred"]:
+        print(f"policy: {len(decision['deferred'])} package(s) deferred (soak/incident watch); "
+              "run 'python3 policy.py' or see state/fix-policy.json for the queue")
     if not vuln_pkgs:
         print("nothing to fix"); return 0
     dry = apt("sim", vuln_pkgs, simulate=True)
@@ -63,6 +70,8 @@ def main():
         f.write(json.dumps({"ts": int(time.time()), "action": "apt-only-upgrade", "host": "mounted",
                             "ok": ok, "packages": upgrade_pkgs, "output_tail": out[-300:]}) + "\n")
     print("done, journal at", STATE / "journal.jsonl", "" if ok else "BUT apt errored; see journal")
+    if ok:
+        policy.note_applied(upgrade_pkgs)
     return 0 if ok else 1
 
 

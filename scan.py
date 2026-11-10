@@ -130,6 +130,16 @@ def write_report(path, findings, meta):
             lines.append(f" - {'🚨KEV ' if f.get('kev') else ''}[{f['severity']}] {f['target']} "
                          f"{f.get('package','')} {f.get('installed','')} {f.get('cve','')} -> {f.get('fix','')}")
     lines += ["", "_No fix was applied; this tool is detect-and-report by default. See docs/FIXING.md._"]
+    try:  # surface the fix-policy queue (soaking / incident-held) if a fixer has run here
+        pol = json.loads((path.parent / "fix-policy.json").read_text())
+        pend = list(pol.get("pending", {}).values())
+        if pend:
+            lines.append("")
+            lines.append(f"## Fix policy queue ({len(pend)} deferred)")
+            for p in sorted(pend, key=lambda x: x.get("reason", ""))[:15]:
+                lines.append(f" - {p['pkg']} [{p.get('severity','?')}] {p['reason']}")
+    except Exception:
+        pass
     path.write_text("\n".join(lines))
 
 
