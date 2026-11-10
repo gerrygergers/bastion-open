@@ -1,18 +1,24 @@
-# Security model (read me first)
+# Security model — quick index
 
-- **What the scanner does:** reads `/etc/os-release`, `/var/lib/dpkg/status`,
-  `/proc/net/tcp*`, `/var/run/reboot-required` on the mounted host. Read-only
-  file access, outbound HTTPS to api.osv.dev, cisa.gov, and your configured
-  URLs. No credentials stored or required.
-- **Why mount `/` at all, if only a few paths are read:** simplicity. If you'd
-  rather restrict it, mount just those paths (`-v /etc/os-release:/host/etc/os-release:ro`
-  etc) and it degrades gracefully with a scan-gap finding.
-- **The fixer is different:** `fix.py` needs a read-WRITE host mount and runs
-  apt inside `chroot`. That's why it's behind a compose profile, two env gates,
-  a live dry-run guard, and a journal. Treat it like the tool that edits your
-  system, because it is.
-- **Supply chain:** the image is `python:3.12-slim` + trivy (pinned by version,
-  downloaded over HTTPS) + pyyaml. `docker build --no-cache` to reproduce; the
-  trivy version lives in one ARG.
-- **Data:** everything stays in the `bastion-data` volume. Reports contain
-  package names and CVE IDs — ordinary to publish, but your call.
+Full threat model, privilege shape, and honest coverage limits:
+**[docs/SECURITY-MODEL.md](docs/SECURITY-MODEL.md)**. Read it before running
+the fixer or pointing the scanner at machines you didn't build.
+
+## Reporting a vulnerability
+
+If you believe you've found a security issue in bastion-open, please report it
+privately via GitHub → Security tab → "Report a vulnerability"
+(https://github.com/gerrygergers/bastion-open/security/advisories/new).
+
+- What: anything that lets the tool mutate a system outside its documented
+  gates, exfiltrate inventory data, or bypass the fix policy.
+- Timeline: acknowledged within 7 days, fixed or disputed within 30.
+- Please don't open a public issue first. Credit on request.
+
+## Hardening the fixer before you turn it on
+
+`docs/FIXING.md` covers the gates and policy; in short: urgent (KEV or
+critical+CVSS≥9) applies immediately, everything else soaks 48h for
+supply-chain safety, and packages you list in `config/incidents.yaml` are held
+for human review forever. Dry-run is always available and always safe:
+`fix.py --dry-run`.

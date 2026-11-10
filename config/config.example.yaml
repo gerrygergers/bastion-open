@@ -1,17 +1,27 @@
-# bastion-open inventory. Everything here is OPTIONAL — with no config the
-# scanner just audits the mounted host (/:/host). Add targets as you like.
+# bastion-open configuration. Copy to config.yaml and edit; everything here is
+# OPTIONAL — with no config the scanner audits the mounted host (/:/host).
+# (A .json twin exists for hosts without pyyaml; YAML is the normal format.)
 
 targets:
   - name: local-host          # this machine, via the :/host mount
     host: /host
-  # - name: my-web-image       # any docker image, via trivy
-  #   image: nginx:latest
-  # - name: my-app-checkout    # a source tree you keep mounted (trivy fs)
-  #   fs: /scan/app
-  # - name: second-box         # another machine: run bastion-open ON that box,
-  #   host: /host              # forward results; v0.1 scans hosts it runs on.
 
-urls:
-  # public endpoints you want probed for degradation (4xx/5xx/timeout -> finding)
-  # - https://example.com
+  # - name: web-image         # any docker image, via trivy (built into the image)
+  #   image: nginx:latest
+  # - name: app-checkout      # a source tree you keep mounted (trivy fs)
+  #   fs: /scan/app
+
+  # - name: second-box        # agentless remote Linux box over ssh: needs key
+  #   ssh: 10.0.0.21           # auth + known_hosts on the SCAN CONTAINER's user
+  #   user: gerry             # default: your ssh default user
+
+urls:                          # public endpoints probed for HTTP + TLS expiry
   # - https://status.example.com
+
+configbench: true              # static config checks (sshd, perms, auth); high precision
+
+# alert:                         # silence-by-default; NEW crit/high + KEV only
+#   webhooks:
+#     - ntfy: https://ntfy.sh/your-random-topic-name
+#     # any JSON webhook (Slack-compatible):
+#     # - url: https://hooks.example.com/services/T/B/xyz

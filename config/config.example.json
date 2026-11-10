@@ -1,0 +1,5 @@
+{
+ "targets": [{"name": "local-host", "host": "/host"}],
+ "urls": [],
+ "configbench": true
+}

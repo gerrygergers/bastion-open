@@ -1,5 +1,6 @@
 # bastion-open: your host's security posture, one command.
-# Copy to your machine: docker compose up  (or run.sh). No creds needed to start.
+# Copy to your machine: docker compose run --build --rm scanner  (or ./install.sh).
+# No creds needed to start.
 name: bastion-open
 services:
   scanner:
@@ -9,25 +10,52 @@ services:
       - /:/host:ro              # host inventory (read-only; the whole point)
       - ./config:/app/config:ro
       - bastion-data:/data      # caches + reports, survives restarts
+      # image: targets in config need the docker API; this socket is
+      # root-equivalent — only uncomment if you accept that:
+      # - /var/run/docker.sock:/var/run/docker.sock:ro
+      # fs: targets scan mounted trees; mount whatever you list in config:
+      # - /srv/myapp:/scan/app:ro
+    cap_drop: [ALL]             # least privilege: nothing but file reads
+    cap_add: [DAC_READ_SEARCH]  # …plus host /etc/shadow for the auth checks
+    read_only: true             # the container's own rootfs is immutable
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
     environment:
       BASTION_HOST: /host
-      # BASTION_MARK_FIXABLE: "1"   # root only; annotates findings with "apt could upgrade X"
+      # (fixable-annotation happens in fix.py --dry-run; the scan user is
+      #  non-root by design and cannot chroot. See docs/FIXING.md.)
     # To scan docker images/URLs too, list them in config/config.yaml (see example).
     command: python3 /app/scan.py
-    # Weekly scans: run via your own cron/systemd timer (`docker compose run --rm scanner`).
-  fixer:                        # OPTIONAL remediation (docs/FIXING.md). Needs rw host mount.
+    # Weekly scans: docker compose run --rm scanner via cron/systemd timer
+    # (deploy/ ships a timer), or ./install.sh --timer.
+  fleet:                        # OPTIONAL agentless ssh targets (docs/REMOTE.md)
+    image: bastion-open:local
+    profiles: ["fleet"]         # run: docker compose run --rm fleet
+    entrypoint: ["python3", "/app/scan.py"]
+    user: "0:0"                 # same cap-dropped shape as the scanner
+    volumes:
+      - ./config:/app/config:ro
+      - bastion-data:/data
+      - ~/.ssh:/root/.ssh:ro    # keys + known_hosts for ssh targets
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+  fixer:                        # OPTIONAL remediation (docs/FIXING.md). rw host mount.
     image: bastion-open:local
     profiles: ["fix"]           # never starts unless: docker compose --profile fix run fixer
     entrypoint: ["python3", "/app/fix.py"]
+    user: root                  # chroot+apt needs it; ONLY this service, ONLY rw mount
     volumes:
       - /:/host                 # READ-WRITE — that's why it's double-gated
       - ./config:/app/config:ro
       - bastion-data:/data
+    security_opt: ["no-new-privileges:true"]
     environment:
       BASTION_FIX: "on"
       BASTION_FIX_CONFIRM: "yes-i-understand"
-      # Fix policy (docs/FIXING.md): urgent = KEV/critical/CVSS>=urgent-cvss applies now,
-      # rest waits soak-hours. Tune if you like; defaults shown.
+      # Fix policy (docs/FIXING.md): urgent = KEV / critical+CVSS>=urgent-cvss
+      # applies now, rest waits soak-hours. Tune if you like; defaults shown.
       BASTION_SOAK_HOURS: "48"
       BASTION_URGENT_CVSS: "9.0"
 volumes:

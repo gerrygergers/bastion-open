@@ -2,17 +2,19 @@
 """Fix policy — decides WHICH packages the opt-in fixer may apply, not just whether
 it runs at all. The same discipline we run internally, published (2026-11-10):
 
-  URGENT  (CISA KEV hit | severity critical | CVSS >= BASTION_URGENT_CVSS [9.0])
+  URGENT  (CISA KEV hit | severity critical AND CVSS >= BASTION_URGENT_CVSS [9.0])
           -> apply now, unless the package sits under a supply-chain incident
              watch, in which case even urgent is HELD for a human.
   ALL OTHERS fixable -> soak BASTION_SOAK_HOURS [48] before applying. The clock
           starts at max(first seen here, when the fix advisory was published),
           so a brand-new upstream release always soaks, and a mature fix on a
           box you just discovered waits at most 48h from first sight.
-  INCIDENT WATCH: names listed unresolved in config/incidents.yaml (xz-style
-          poisoned releases) are never auto-applied. The KEV *catalog product*
-          matches are deliberately NOT incident signals — they'd block e.g.
-          'kernel' forever.
+          (A bare "critical" label with no CVSS score soaks — this matches the
+          shipped policy from 2026-11-10.)
+  INCIDENT WATCH: names listed unresolved in config/incidents.yaml, plus exact
+          package names from GitHub's published malware advisories (last 30d),
+          are never auto-applied. The KEV *catalog product* matches are
+          deliberately NOT incident signals — they'd block e.g. 'kernel' forever.
 
 State: <BASTION_STATE>/fix-policy.json (soak queue + applied log).
 fix.py calls decide(); scan.py/report surfaces the queue. Pure stdlib.
@@ -54,9 +56,10 @@ def _incidents():
         except Exception:
             break
     try:
-        from bastion_core import http_json
-        raw = http_json("https://api.github.com/advisories?type=malware&per_page=100", 30)
-        items = raw.get("items", []) if isinstance(raw, dict) else raw  # GH returns a bare list
+        cache = STATE / "gh-malware.json"
+        raw = cache_get_or_fetch(cache, 12 * 3600,
+            "https://api.github.com/advisories?type=malware&per_page=100")
+        items = raw.get("items", []) if isinstance(raw, dict) else (raw or [])  # GH returns a bare list
         cutoff = time.time() - 30 * 86400
         for i in items:
             try:
@@ -74,6 +77,18 @@ def _incidents():
     return out
 
 
+def cache_get_or_fetch(path, ttl, url):
+    from bastion_core import http_json, cache_get
+    c = cache_get(path, ttl)
+    if c is None:
+        c = http_json(url, 30)
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        tmp = Path(str(path) + ".tmp")
+        tmp.write_text(json.dumps(c))
+        os.replace(tmp, path)
+    return c
+
+
 def load():
     try:
         st = json.loads((STATE / "fix-policy.json").read_text())
@@ -88,7 +103,7 @@ def save(st):
     STATE.mkdir(parents=True, exist_ok=True)
     tmp = STATE / "fix-policy.json.tmp"
     tmp.write_text(json.dumps(st, indent=1, default=str))
-    tmp.replace(STATE / "fix-policy.json")
+    os.replace(tmp, STATE / "fix-policy.json")
 
 
 def _pub_ts(iso):
@@ -101,12 +116,14 @@ def _pub_ts(iso):
         return None
 
 
-def decide(findings):
+def decide(findings, cfg=None, incidents=None, now=None):
     """findings = list from last-scan.json. Returns {"apply": set(packages),
-    "deferred": [{package, reason, eta_h}]}."""
-    cfg = _cfg()
+    "deferred": [{package, reason, eta_h}]}. cfg/incidents/now are injectable
+    for tests; production calls pass nothing."""
+    cfg = cfg or _cfg()
+    now = now or time.time()
     st = load()
-    incidents = _incidents()
+    incidents = incidents if incidents is not None else _incidents()
     grouped = {}
     for f in findings:
         if f.get("kind") != "cve-os" or not f.get("package"):
@@ -125,12 +142,14 @@ def decide(findings):
             g["pub"] = p
 
     def urgent(g):
-        return bool(g["kev"] or g["sev"] == "critical" or g["score"] >= cfg["cvss"])
+        # parity with the internal engine (2026-11-10): KEV OR (critical AND cvss>=X).
+        # A bare critical label with no score soaks 48h.
+        return bool(g["kev"] or (g["sev"] == "critical" and g["score"] >= cfg["cvss"]))
 
     apply_set, deferred, pending = set(), [], {}
     for pkg, g in grouped.items():
         prior = st["pending"].get(pkg)
-        first_seen = prior["first_seen"] if prior else NOW
+        first_seen = prior["first_seen"] if prior else now
         start = max(first_seen, g["pub"]) if g["pub"] else first_seen
         hit = incidents.get(pkg.lower()) or incidents.get("!" + pkg.lower())
         if hit:
@@ -142,7 +161,7 @@ def decide(findings):
             # keep the pending entry; note_applied()/pruning clears it once the
             # upgrade actually lands (no apt candidate = retried next run)
             continue
-        elif NOW - start >= cfg["soak"]:
+        elif now - start >= cfg["soak"]:
             apply_set.add(pkg)  # matured; same bookkeeping as above
             continue
         else:
@@ -150,7 +169,7 @@ def decide(findings):
                 int(cfg["soak"] / 3600),
                 time.strftime("%Y-%m-%d", time.gmtime(g["pub"])) if g["pub"] else "unknown",
                 time.strftime("%Y-%m-%d", time.gmtime(first_seen)))
-            eta = round((cfg["soak"] - (NOW - start)) / 3600, 1)
+            eta = round((cfg["soak"] - (now - start)) / 3600, 1)
         pending[pkg] = {"first_seen": first_seen, "pkg": pkg, "cves": sorted(set(g["cves"]))[:8],
                         "kev": g["kev"], "severity": g["sev"], "cvss": g["score"],
                         "reason": reason, "eta_h": eta}

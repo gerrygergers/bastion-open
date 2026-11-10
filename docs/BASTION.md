@@ -17,4 +17,6 @@ What was left behind, on purpose:
 - all ssh targets, hostnames, IPs, credentials (none here; config is the only
   place identity could appear, and it ships empty)
 - network-appliance integrations (controller APIs)
-- the agent-harness cron gating (this is a normal tool; run it with a normal timer)
+- the agent-harness cron gating (this is a normal tool; run it with a normal
+  timer). The ssh fleet mode came back in v0.2 as a generic, credential-free
+  `ssh:` target (docs/REMOTE.md).

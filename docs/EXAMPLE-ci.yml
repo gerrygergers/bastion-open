@@ -1,0 +1,38 @@
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+  schedule: [{ cron: "17 6 * * 1" }]   # weekly: catches advisory-feed drift
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install pyyaml pytest
+      - name: unit tests
+        run: python3 -m pytest tests/ -q
+      - name: selftest (stdlib-only path)
+        run: python3 scripts/selftest.py
+      - name: scan the runner itself (smoke; no gate)
+        run: |
+          sudo mkdir -p /host || true
+          sudo mount --bind / /host 2>/dev/null || true
+          BASTION_HOST=/ BASTION_STATE=$PWD/state python3 scan.py || test $? -eq 10
+      - name: build image
+        run: docker build -t bastion-open:ci .
+      - name: image smoke (runs as the scan user)
+        run: docker run --rm -v /:/host:ro -v bastion-data:/data bastion-open:ci python3 /app/bastion.py version
+  self-vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: trivy on our own Dockerfile deps
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
